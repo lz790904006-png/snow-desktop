@@ -15,7 +15,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt pyinstaller
-      - run: pyinstaller --onefile --noconsole --name 桌面下雪 snow_desktop.py
+      - run: pyinstaller --onefile --noconsole --name SnowDesktop snow_desktop.py
       - uses: actions/upload-artifact@v4
         with:
           name: snow-desktop-exe

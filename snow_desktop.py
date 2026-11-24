@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-桌面下雪 免费版（Windows 10/11）
+桌面下雪 v4（Windows 10/11）
 - 60 帧 pygame + numpy，雪花顺滑飘落
-- 雪会落在窗口顶边上，堆成自然的雪檐；窗口关闭、最小化或被甩动时雪会掉下来
+- 雪会落在窗口顶边上，堆成两头低、中间起伏的自然雪檐；窗口关闭、最小化、改大小或被甩动时雪会掉下来
 - 鼠标划过积雪会把雪推开、溅起雪沫
-- 完整版另有：可撞倒、可重新堆的物理雪人，抛雪铲雪车，开机自启
+- 履带推土机：履带会转、排气管冒烟，推铲把雪顶起来往前撒开，一部分化成雪雾
+- 新雪人：带明暗的三个雪球，鼠标一撞就会倒，三个球各自滚动、互相碰撞，帽子飞出去
+- 雪人倒了以后，鼠标左键单击任意一个掉落的雪球，就会在那里重新堆起雪人
+- 雪人有 6 套衣服（经典、圣诞老人、滑雪运动、国王、夏日度假、绅士），每 25 秒自动换一套，托盘「换衣服」手动换
 运行：python snow_desktop.py
 依赖：pip install pygame numpy pystray pillow
 退出：右下角托盘的雪人图标 → 退出
@@ -24,8 +27,6 @@ IS_WIN = sys.platform == "win32"
 TEST_FRAMES = int(os.environ.get("SNOW_TEST_FRAMES", "0"))   # 测试用：非 0 时无窗口运行并截图
 
 # ================= 可调参数 =================
-FREE_EDITION = True      # 免费版：不含雪人和铲雪车
-FREE_GROUND_MAX = 40     # 免费版地面积雪最高高度（像素）
 FPS = 60
 FLAKE_COUNT = 260        # 同时飘落的雪花数
 FLAKE_VOL = 0.55         # 每片雪花带来的积雪量（像素高度）
@@ -39,7 +40,7 @@ PLOW_VANISH = 0.4        # 铲起来的雪有多少比例化成雪雾消失
 MOUSE_R = 6              # 鼠标推雪半径（列）
 WIN_SCAN_EVERY = 5       # 每几帧扫描一次窗口
 FAST_MOVE = 45           # 窗口一次扫描移动超过这么多像素算「甩动」
-HAT_SECONDS = 20         # 雪人站着时换帽子间隔
+HAT_SECONDS = 25         # 雪人站着时自动换一套衣服的间隔（秒）
 GRAVITY = 0.35           # 雪球重力
 KEY = (255, 0, 255)      # 透明色
 
@@ -365,7 +366,7 @@ def mouse_push():
                   random.uniform(-3.5, -1.2), rem * 0.3)
         return
 
-# ================= 铲雪车（抛雪机）=================
+# ================= 履带推土机 =================
 plow = {"on": False, "x": -200.0}
 
 def call_plow():
@@ -388,12 +389,12 @@ def plow_step():
         ground.h[lo:hi] = 0
         keep = carried * (1 - PLOW_VANISH)
         fx0 = plow_front() - 4
-        fy0 = GROUND - 30
+        fy0 = GROUND - 52                                    # 铲板顶部
         while keep > 0:
             part = min(keep, random.uniform(0.4, 1.4))
             keep -= part
-            sp = random.uniform(3, 10)
-            ang = random.uniform(math.radians(35), math.radians(80))
+            sp = random.uniform(2.5, 7)                      # 推土机：雪顺着铲板翻上去再往前撒
+            ang = random.uniform(math.radians(50), math.radians(85))
             spawn(fx0, fy0 + random.uniform(-10, 10), PLOW_SPEED + sp * math.cos(ang),
                   -sp * math.sin(ang), part, spread=0.8)
         for _ in range(min(12, int(carried * 0.6) + 2)):       # 雪雾
@@ -479,7 +480,91 @@ def coal(sp, x, y, r):
     pygame.draw.circle(sp, (28, 28, 34), (int(x), int(y)), r)
     pygame.draw.circle(sp, (120, 120, 135), (int(x - r * 0.35), int(y - r * 0.35)), max(1, r // 3))
 
+# ================= 雪人装扮 =================
+# 每套：名字、帽子编号、围巾/领子样式、纽扣、手套、脸上配饰
+OUTFITS = [
+    {"name": "经典",     "hat": 0, "neck": "scarf_red",  "btn": "coal", "mitt": None,            "face": None},
+    {"name": "圣诞老人", "hat": 1, "neck": "santa",      "btn": "red",  "mitt": (40, 40, 44),    "face": "beard"},
+    {"name": "滑雪运动", "hat": 2, "neck": "scarf_blue", "btn": "coal", "mitt": (230, 60, 60),   "face": "goggles"},
+    {"name": "国王",     "hat": 3, "neck": "cape",       "btn": "gold", "mitt": (250, 250, 252), "face": None},
+    {"name": "夏日度假", "hat": 4, "neck": "lei",        "btn": "coal", "mitt": None,            "face": "sunglasses"},
+    {"name": "绅士",     "hat": 0, "neck": "bowtie",     "btn": "coal", "mitt": (245, 245, 245), "face": "monocle"},
+]
+outfit = {"i": 0}
+
+def draw_neck(sp, c, r, style):
+    """在中间雪球顶部画围巾 / 领子"""
+    dc = pygame.draw
+    ny = c - r                      # 脖子位置
+    if style in ("scarf_red", "scarf_blue"):
+        if style == "scarf_red":
+            main, dark, stripe = (206, 44, 52), (160, 28, 38), (250, 236, 210)
+        else:
+            main, dark, stripe = (40, 110, 210), (24, 70, 150), (250, 250, 255)
+        dc.ellipse(sp, main, (c - r * 0.8, ny - 6, r * 1.6, 14))
+        for k in range(4):
+            xx = c - r * 0.6 + k * r * 0.4
+            dc.line(sp, stripe, (xx, ny - 4), (xx + 4, ny + 6), 2)
+        tail = [(c + r * 0.25, ny + 2), (c + r * 0.55, ny + 2), (c + r * 0.65, ny + 30), (c + r * 0.32, ny + 32)]
+        dc.polygon(sp, main, tail)
+        dc.line(sp, dark, tail[1], tail[2], 2)
+        for k in range(4):
+            fx_ = c + r * 0.34 + k * 4
+            dc.line(sp, main, (fx_, ny + 31), (fx_, ny + 37), 2)
+    elif style == "santa":          # 白毛领 + 黑腰带金扣
+        for k in range(7):
+            dc.circle(sp, (250, 250, 252), (int(c - r * 0.7 + k * r * 0.233), int(ny + 1)), 6)
+        dc.rect(sp, (30, 30, 34), (c - r * 0.97, c + r * 0.22, r * 1.94, 8))
+        dc.rect(sp, (240, 190, 40), (c - 7, c + r * 0.22 - 2, 14, 12), 3)
+    elif style == "cape":           # 紫色披风领 + 白色貂皮点点
+        dc.polygon(sp, (110, 40, 150), [(c - r * 1.05, ny + 14), (c - r * 0.6, ny - 6), (c + r * 0.6, ny - 6), (c + r * 1.05, ny + 14), (c, ny + 8)])
+        dc.ellipse(sp, (250, 250, 252), (c - r * 0.75, ny - 8, r * 1.5, 11))
+        for k in range(5):
+            dc.circle(sp, (20, 20, 24), (int(c - r * 0.5 + k * r * 0.25), int(ny - 3)), 1)
+    elif style == "lei":            # 夏威夷花环
+        cols = [(255, 90, 140), (255, 200, 40), (255, 130, 40), (180, 90, 230), (60, 200, 140)]
+        for k in range(11):
+            a = math.radians(200 + k * 14)
+            dc.circle(sp, cols[k % 5], (int(c + math.cos(a) * r * 0.75), int(ny + 6 - math.sin(a) * 9)), 4)
+    elif style == "bowtie":         # 黑领结
+        dc.polygon(sp, (24, 24, 28), [(c, ny + 4), (c - 14, ny - 4), (c - 14, ny + 12)])
+        dc.polygon(sp, (24, 24, 28), [(c, ny + 4), (c + 14, ny - 4), (c + 14, ny + 12)])
+        dc.circle(sp, (60, 60, 70), (int(c), int(ny + 4)), 4)
+
+def draw_buttons(sp, c, r, style):
+    for k in range(3):
+        y = c - r * 0.25 + k * r * 0.33
+        if style == "red":
+            pygame.draw.circle(sp, (210, 40, 50), (int(c), int(y)), 4)
+        elif style == "gold":
+            pygame.draw.circle(sp, (240, 196, 40), (int(c), int(y)), 4)
+            pygame.draw.circle(sp, (255, 240, 170), (int(c - 1), int(y - 1)), 1)
+        else:
+            coal(sp, c, y, 4)
+
+def draw_face_extra(sp, c, r, style):
+    dc = pygame.draw
+    ex, ey = r * 0.36, c - r * 0.22
+    if style == "beard":            # 白胡子盖住嘴
+        for k in range(9):
+            a = math.radians(20 + k * 17.5)
+            dc.circle(sp, (250, 250, 252), (int(c + math.cos(a) * r * 0.62), int(c + r * 0.2 + math.sin(a) * r * 0.55)), 7)
+        dc.circle(sp, (250, 250, 252), (int(c), int(c + r * 0.85)), 8)
+    elif style == "goggles":        # 滑雪镜
+        dc.line(sp, (40, 40, 44), (c - r * 0.95, ey), (c + r * 0.95, ey), 3)
+        dc.ellipse(sp, (255, 150, 30), (c - ex - 9, ey - 7, 18 + ex * 2, 14))
+        dc.ellipse(sp, (60, 60, 64), (c - ex - 9, ey - 7, 18 + ex * 2, 14), 2)
+        dc.line(sp, (255, 230, 170), (c - ex - 3, ey - 3), (c - ex + 4, ey - 3), 2)
+    elif style == "sunglasses":     # 墨镜
+        for sx in (-1, 1):
+            dc.ellipse(sp, (20, 20, 24), (c + sx * ex - 7, ey - 5, 14, 11))
+        dc.line(sp, (20, 20, 24), (c - ex + 6, ey - 2), (c + ex - 6, ey - 2), 2)
+    elif style == "monocle":        # 单片眼镜
+        dc.circle(sp, (200, 170, 60), (int(c + ex), int(ey)), 8, 2)
+        dc.line(sp, (200, 170, 60), (c + ex + 5, ey + 6), (c + ex + 9, ey + 22), 1)
+
 def make_ball(kind, r):
+    o = OUTFITS[outfit["i"]]
     pad = 46 if kind == "mid" else (30 if kind == "head" else 4)
     S = 2 * (r + pad)
     sp = new_sprite(S, S)
@@ -493,25 +578,16 @@ def make_ball(kind, r):
             pygame.draw.line(sp, (98, 64, 36), (mx, my), (mx + sgn * 8, my - 13), 3)
             pygame.draw.line(sp, (98, 64, 36), (x1, y1), (x1 + sgn * 9, y1 - 3), 2)
             pygame.draw.line(sp, (98, 64, 36), (x1, y1), (x1 + sgn * 3, y1 - 10), 2)
+            if o["mitt"]:                   # 手套
+                pygame.draw.circle(sp, o["mitt"], (int(x1), int(y1)), 7)
+                pygame.draw.circle(sp, o["mitt"], (int(x1 - sgn * 5), int(y1 + 3)), 4)
     shaded_ball(sp, c, r)
     if kind == "bottom":
         for (dx, dy) in ((-0.35, -0.2), (0.3, 0.25), (-0.1, 0.45)):
             pygame.draw.circle(sp, (238, 244, 251), (int(c + dx * r), int(c + dy * r)), 3)
     elif kind == "mid":
-        for k in range(3):
-            coal(sp, c, c - r * 0.25 + k * r * 0.33, 4)
-        # 围巾：脖子上一圈 + 垂下来的一条
-        red, red2, stripe = (206, 44, 52), (160, 28, 38), (250, 236, 210)
-        pygame.draw.ellipse(sp, red, (c - r * 0.8, c - r - 6, r * 1.6, 14))
-        for k in range(4):
-            xx = c - r * 0.6 + k * r * 0.4
-            pygame.draw.line(sp, stripe, (xx, c - r - 4), (xx + 4, c - r + 6), 2)
-        tail = [(c + r * 0.25, c - r + 2), (c + r * 0.55, c - r + 2), (c + r * 0.65, c - r + 30), (c + r * 0.32, c - r + 32)]
-        pygame.draw.polygon(sp, red, tail)
-        pygame.draw.line(sp, red2, tail[1], tail[2], 2)
-        for k in range(4):
-            fx_ = c + r * 0.34 + k * 4
-            pygame.draw.line(sp, red, (fx_, c - r + 31), (fx_, c - r + 37), 2)
+        draw_buttons(sp, c, r, o["btn"])
+        draw_neck(sp, c, r, o["neck"])
     elif kind == "head":
         coal(sp, c - r * 0.36, c - r * 0.22, 4)
         coal(sp, c + r * 0.36, c - r * 0.22, 4)
@@ -525,6 +601,7 @@ def make_ball(kind, r):
         for k in range(5):
             a = math.radians(200 + k * 35)
             coal(sp, c + math.cos(a) * r * 0.5 * -1, c + r * 0.38 + abs(k - 2) * -2, 2)
+        draw_face_extra(sp, c, r, o["face"])
     return sp
 
 def make_hat(style):
@@ -571,6 +648,15 @@ class Ball:
         self.w = 0.0            # 空中自转
 
 balls = [Ball("bottom", 36), Ball("mid", 27), Ball("head", 20)]
+
+def set_outfit(i):
+    """换一整套衣服：重画雪球贴图 + 换帽子"""
+    outfit["i"] = i % len(OUTFITS)
+    for b in balls:
+        b.sprite = make_ball(b.kind, b.r)
+    hat["style"] = OUTFITS[outfit["i"]]["hat"]
+    hat["t"] = time.time()
+
 hat = {"style": 0, "x": 0.0, "y": 0.0, "vx": 0.0, "vy": 0.0, "ang": 0.0, "w": 0.0, "t": time.time()}
 sm = {"state": "stand", "bx": SW - 130, "build": 0, "from": None}
 
@@ -611,8 +697,7 @@ def step_snowman():
             ball.x, ball.y, ball.vx, ball.vy, ball.ang = x, y, 0, 0, 0
         hat["x"], hat["y"], hat["ang"] = hp[0], hp[1], 0
         if time.time() - hat["t"] > HAT_SECONDS:
-            hat["style"] = (hat["style"] + 1) % len(HAT_SPRITES)
-            hat["t"] = time.time()
+            set_outfit(outfit["i"] + 1)
         # 鼠标撞上去
         sp = math.hypot(mouse["dx"], mouse["dy"])
         for ball in balls:
@@ -744,28 +829,53 @@ def draw_snowman():
         spr = pygame.transform.rotate(spr, hat["ang"])
     screen.blit(spr, spr.get_rect(center=(int(hat["x"]), int(hat["y"]))))
 
-# ================= 铲雪车外观 =================
+# ================= 履带推土机外观 =================
 def draw_plow():
     if not plow["on"]:
         return
     x, g = int(plow["x"]), GROUND
     dc = pygame.draw
-    dc.rect(screen, (243, 156, 18), (x, g - 42, 110, 28), border_radius=4)
-    dc.rect(screen, (163, 95, 0), (x, g - 42, 110, 28), 2, border_radius=4)
-    dc.rect(screen, (243, 156, 18), (x + 55, g - 74, 45, 34), border_radius=4)
-    dc.rect(screen, (163, 95, 0), (x + 55, g - 74, 45, 34), 2, border_radius=4)
-    dc.rect(screen, (174, 227, 255), (x + 63, g - 68, 30, 20))
+    Y, YD, DK = (245, 180, 20), (170, 115, 0), (40, 40, 44)
+    # 履带：圆角长条 + 会动的履带齿
+    tx0, tx1, ty0, ty1 = x + 4, x + 112, g - 26, g - 1
+    dc.rect(screen, DK, (tx0, ty0, tx1 - tx0, ty1 - ty0), border_radius=12)
+    off = int(plow["x"] * 1.0) % 10
+    for px in range(tx0 + 8 - off, tx1 - 6, 10):        # 上下两排履带齿
+        dc.line(screen, (90, 90, 96), (px, ty0 + 1), (px, ty0 + 5), 3)
+        dc.line(screen, (90, 90, 96), (px, ty1 - 5), (px, ty1 - 1), 3)
+    for wx in (tx0 + 12, tx1 - 12):                     # 驱动轮 / 引导轮
+        dc.circle(screen, (70, 70, 76), (wx, g - 13), 10)
+        dc.circle(screen, (150, 150, 156), (wx, g - 13), 4)
+    for wx in range(tx0 + 30, tx1 - 24, 17):            # 负重轮
+        dc.circle(screen, (100, 100, 106), (wx, g - 11), 6)
+    # 机身
+    dc.rect(screen, Y, (x + 6, g - 50, 102, 24), border_radius=3)
+    dc.rect(screen, YD, (x + 6, g - 50, 102, 24), 2, border_radius=3)
+    for k in range(5):                                  # 发动机散热格栅
+        dc.line(screen, YD, (x + 70 + k * 6, g - 46), (x + 70 + k * 6, g - 32), 2)
+    # 驾驶室
+    dc.rect(screen, Y, (x + 14, g - 88, 46, 40), border_radius=3)
+    dc.rect(screen, YD, (x + 14, g - 88, 46, 40), 2, border_radius=3)
+    dc.rect(screen, (174, 227, 255), (x + 20, g - 82, 34, 20))
+    dc.line(screen, (230, 248, 255), (x + 24, g - 80), (x + 32, g - 66), 2)
+    dc.rect(screen, YD, (x + 10, g - 92, 54, 6))         # 顶棚
     blink = (231, 76, 60) if (pygame.time.get_ticks() // 300) % 2 else (255, 200, 60)
-    dc.rect(screen, blink, (x + 70, g - 82, 10, 8))
-    # 抛雪口
-    dc.polygon(screen, (90, 96, 100), [(x + 112, g - 30), (x + 140, g - 58), (x + 150, g - 50), (x + 124, g - 22)])
-    dc.polygon(screen, (127, 140, 141), [(x + 112, g - 34), (x + 146, g - 30), (x + 146, g), (x + 112, g - 3)])
-    dc.polygon(screen, (77, 86, 86), [(x + 112, g - 34), (x + 146, g - 30), (x + 146, g), (x + 112, g - 3)], 2)
+    dc.rect(screen, blink, (x + 32, g - 99, 10, 7))
+    # 排气管 + 黑烟
+    dc.rect(screen, DK, (x + 84, g - 72, 6, 22))
+    t = pygame.time.get_ticks() / 1000.0
     for k in range(3):
-        dc.line(screen, (70, 75, 78), (x + 118 + k * 9, g - 30), (x + 118 + k * 9, g - 4), 2)
-    for wx in (x + 22, x + 82):
-        dc.circle(screen, (44, 44, 44), (wx, g - 13), 15)
-        dc.circle(screen, (150, 150, 150), (wx, g - 13), 6)
+        ph = (t * 1.5 + k / 3.0) % 1.0
+        rr = int(3 + ph * 7)
+        dc.circle(screen, (110, 110, 116), (int(x + 87 - ph * 22), int(g - 76 - ph * 26)), rr)
+    # 推铲支臂
+    dc.line(screen, YD, (x + 96, g - 22), (x + 132, g - 20), 6)
+    dc.line(screen, YD, (x + 100, g - 44), (x + 132, g - 38), 5)
+    # 推铲：弧形铲板 + 铲刃
+    blade = [(x + 132, g - 58), (x + 142, g - 60), (x + 148, g - 40), (x + 147, g - 18), (x + 150, g), (x + 134, g), (x + 136, g - 22), (x + 136, g - 42)]
+    dc.polygon(screen, Y, blade)
+    dc.polygon(screen, YD, blade, 2)
+    dc.line(screen, (120, 120, 126), (x + 134, g - 1), (x + 150, g - 1), 3)
 
 # ================= 托盘 =================
 cmds = []
@@ -787,6 +897,9 @@ def start_tray():
         icon.stop()
 
     menu = pystray.Menu(
+        pystray.MenuItem("换衣服", lambda i, it: cmds.append("hat")),
+        pystray.MenuItem("重新堆雪人", lambda i, it: cmds.append("build")),
+        pystray.MenuItem("叫推土机", lambda i, it: cmds.append("plow")),
         pystray.MenuItem("清空积雪", lambda i, it: cmds.append("clear")),
         pystray.MenuItem("退出", quit_app),
     )
@@ -829,8 +942,7 @@ def main():
         while cmds:
             c = cmds.pop(0)
             if c == "hat":
-                hat["style"] = (hat["style"] + 1) % len(HAT_SPRITES)
-                hat["t"] = time.time()
+                set_outfit(outfit["i"] + 1)
             elif c == "build":
                 rebuild(sm["bx"] if sm["state"] == "stand" else balls[0].x)
             elif c == "plow":
@@ -846,27 +958,22 @@ def main():
         step_flakes(t)
         step_particles()
         mouse_push()
-        if not FREE_EDITION:
-            plow_step()
+        plow_step()
         relax(ground, 2)
         for s in z_order:
             relax(s, 2)
-        if FREE_EDITION:
-            np.minimum(ground.h, FREE_GROUND_MAX, out=ground.h)   # 免费版：地面积雪封顶
-        else:
-            step_snowman()
-            if not plow["on"] and ground.h.mean() > PLOW_TRIGGER:
-                call_plow()
-            if frame == 60 * 4:
-                call_plow()
+        step_snowman()
+        if not plow["on"] and ground.h.mean() > PLOW_TRIGGER:
+            call_plow()
+        if frame == 60 * 4:
+            call_plow()
 
         screen.fill(KEY)
         for s in reversed(z_order):
             draw_surface(s)
         draw_surface(ground)
-        if not FREE_EDITION:
-            draw_snowman()
-            draw_plow()
+        draw_snowman()
+        draw_plow()
         blits = [(sprites[int(r)], (x - r, y - r)) for x, y, r in zip(fx.tolist(), fy.tolist(), fr.tolist())]
         for i in np.nonzero(P["alive"])[0].tolist():
             v = P["v"][i]

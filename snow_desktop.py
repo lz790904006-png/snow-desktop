@@ -184,7 +184,10 @@ def relax(s, passes=2):
     if s.is_window:
         h -= 0.00004 * (h > 0)                     # 窗口上的雪极慢地化（以前化得比下得快，存不住）
     np.maximum(h, 0, out=h)
-    np.minimum(h, s.cap * 1.15, out=h)
+    if s.is_window:
+        np.minimum(h, s.cap * 1.15, out=h)
+    else:
+        np.minimum(h, GROUND_MAX * 1.6, out=h)        # 地面：窗口掉下来的雪可以堆成雪包，不会被削平
     if s.is_window:
         for side in (0, -1):
             ex = h[side] - 1.0
@@ -202,20 +205,32 @@ def relax(s, passes=2):
             s.spill_r = 0
 
 # ================= 雪块 / 雪沫粒子 =================
-MAXP = 5000
+MAXP = 20000             # 粒子池（以前 5000 太小，一扇大窗口的雪掉下来就把池子占满，旧的雪块被覆盖 = 半空消失）
 P = {k: np.zeros(MAXP) for k in ("x", "y", "vx", "vy", "v", "life")}
 P["alive"] = np.zeros(MAXP, dtype=bool)
 _pi = [0]
 
-def spawn(x, y, vx, vy, vol, spread=0.3, life=9999):
+def _free_slot():
+    """找一个空的粒子位；池子满了才覆盖雪雾，绝不覆盖还在下落的雪块"""
+    i = _pi[0]
+    if P["alive"][i]:
+        free = np.flatnonzero(~P["alive"])
+        if len(free):
+            i = int(free[0])
+        else:
+            mist = np.flatnonzero(P["v"] <= 0)
+            i = int(mist[0]) if len(mist) else i
+    _pi[0] = (i + 1) % MAXP
+    return i
+
+def spawn(x, y, vx, vy, vol, spread=0.3, life=9999, chunk=1.5):
     """受重力的雪块。vol>0 落地变积雪；vol=0 是雪雾，life 帧后消失"""
     first = True
     while vol > 0 or first:
         first = False
-        part = min(vol, 1.5)
+        part = min(vol, chunk)
         vol -= part
-        i = _pi[0]
-        _pi[0] = (i + 1) % MAXP
+        i = _free_slot()
         P["x"][i] = x + random.uniform(-2, 2)
         P["y"][i] = y
         P["vx"][i] = vx + random.uniform(-spread, spread)
@@ -226,7 +241,7 @@ def spawn(x, y, vx, vy, vol, spread=0.3, life=9999):
         if vol <= 1e-6:
             break
 
-def land(xs, y0, y1, vols):
+def land(xs, y0, y1, vols, full=False):
     """从 y0 落到 y1 的点是否落在雪面上，落上就堆积（越接近上限越堆不上去）"""
     landed = np.zeros(len(xs), dtype=bool)
     for s in z_order + [ground]:
@@ -242,9 +257,15 @@ def land(xs, y0, y1, vols):
             hit = ok & s.vis[cc] & (y1 >= top) & (y0 <= top + 3)
         if hit.any():
             c = cc[hit]
-            room = np.clip(1.0 - s.h[c] / np.maximum(s.cap[c], 0.5), 0.0, 1.0)
-            gain = WIN_GAIN if s.is_window else 1.0
-            np.add.at(s.h, c, vols[hit] * gain * (0.15 + 0.85 * room))
+            if full:
+                # 掉下来的雪块：体积一点不丢，摊到左中右三列，像一坨雪砸下来
+                v = vols[hit]
+                for dc, w in ((-1, 0.25), (0, 0.5), (1, 0.25)):
+                    np.add.at(s.h, np.clip(c + dc, 0, s.n - 1), v * w)
+            else:
+                room = np.clip(1.0 - s.h[c] / np.maximum(s.cap[c], 0.5), 0.0, 1.0)
+                gain = WIN_GAIN if s.is_window else 1.0
+                np.add.at(s.h, c, vols[hit] * gain * (0.15 + 0.85 * room))
             landed |= hit
     return landed
 
@@ -264,7 +285,10 @@ def step_particles():
     P["x"][idx], P["y"][idx] = x, y
     P["life"][idx] -= 1
     falling = P["vy"][idx] > 0
-    hit = land(x, y0, y, vol) & falling & ~mist
+    solid = falling & ~mist
+    hit = np.zeros(len(idx), dtype=bool)
+    if solid.any():
+        hit[solid] = land(x[solid], y0[solid], y[solid], vol[solid], full=True)
     gone = hit | (y > SH) | (x < -30) | (x > SW + 30) | (P["life"][idx] <= 0)
     P["alive"][idx[gone]] = False
 
@@ -299,12 +323,14 @@ def step_flakes(t):
 
 # ================= 窗口跟踪 =================
 def drop_surface(s):
+    """窗口关闭 / 最小化 / 甩动：上面的雪成块掉下来，落到下面的窗口或地面上堆起来"""
     xs = s.col_x()
-    for c in range(0, s.n, 2):
-        v = s.h[c] + (s.h[c + 1] if c + 1 < s.n else 0)
+    for c in range(0, s.n, 3):
+        v = float(s.h[c:c + 3].sum())
         if v > 0.3:
-            spawn(xs[c], s.base - s.h[c] * 0.5, random.uniform(-0.4, 0.4),
-                  random.uniform(-0.5, 0.5), v)
+            spawn(xs[c] + COL_W, s.base - s.h[c] * 0.5, random.uniform(-0.3, 0.3),
+                  random.uniform(-0.6, 0.2), v, spread=0.15, chunk=4.0)
+    s.h[:] = 0
 
 def scan_windows():
     global z_order

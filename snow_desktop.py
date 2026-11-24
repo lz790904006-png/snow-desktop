@@ -1,0 +1,894 @@
+# -*- coding: utf-8 -*-
+"""
+桌面下雪 免费版（Windows 10/11）
+- 60 帧 pygame + numpy，雪花顺滑飘落
+- 雪会落在窗口顶边上，堆成自然的雪檐；窗口关闭、最小化或被甩动时雪会掉下来
+- 鼠标划过积雪会把雪推开、溅起雪沫
+- 完整版另有：可撞倒、可重新堆的物理雪人，抛雪铲雪车，开机自启
+运行：python snow_desktop.py
+依赖：pip install pygame numpy pystray pillow
+退出：右下角托盘的雪人图标 → 退出
+说明：目前只支持主显示器
+"""
+import os
+import sys
+import math
+import time
+import random
+import threading
+import ctypes
+
+import numpy as np
+
+IS_WIN = sys.platform == "win32"
+TEST_FRAMES = int(os.environ.get("SNOW_TEST_FRAMES", "0"))   # 测试用：非 0 时无窗口运行并截图
+
+# ================= 可调参数 =================
+FREE_EDITION = True      # 免费版：不含雪人和铲雪车
+FREE_GROUND_MAX = 40     # 免费版地面积雪最高高度（像素）
+FPS = 60
+FLAKE_COUNT = 260        # 同时飘落的雪花数
+FLAKE_VOL = 0.55         # 每片雪花带来的积雪量（像素高度）
+COL_W = 3                # 积雪高度图每列宽度（像素）
+GROUND_MAX = 70          # 地面积雪最高
+WIN_MAX = 16             # 窗口顶上积雪最高（中间部分）
+REPOSE = 2.0             # 安息角：相邻两列高差超过就塌
+PLOW_TRIGGER = 26        # 地面平均积雪超过这个高度，铲雪车出动
+PLOW_SPEED = 2.6         # 铲雪车速度（像素/帧）
+PLOW_VANISH = 0.4        # 铲起来的雪有多少比例化成雪雾消失
+MOUSE_R = 6              # 鼠标推雪半径（列）
+WIN_SCAN_EVERY = 5       # 每几帧扫描一次窗口
+FAST_MOVE = 45           # 窗口一次扫描移动超过这么多像素算「甩动」
+HAT_SECONDS = 20         # 雪人站着时换帽子间隔
+GRAVITY = 0.35           # 雪球重力
+KEY = (255, 0, 255)      # 透明色
+
+# ================= Windows 接口 =================
+if IS_WIN:
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    dwmapi = ctypes.windll.dwmapi
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+    class RECT(ctypes.Structure):
+        _fields_ = [("l", ctypes.c_long), ("t", ctypes.c_long),
+                    ("r", ctypes.c_long), ("b", ctypes.c_long)]
+
+    class POINT(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+    EnumProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.GetWindowLongW.restype = ctypes.c_long
+    user32.GetAsyncKeyState.restype = ctypes.c_short
+
+    def screen_info():
+        r = RECT()
+        user32.SystemParametersInfoW(0x30, 0, ctypes.byref(r), 0)
+        return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1), r.b
+else:
+    def screen_info():
+        return 1280, 720, 680
+
+SW, SH, GROUND = screen_info()
+OVERLAY = None
+
+def get_cursor():
+    if IS_WIN:
+        p = POINT()
+        user32.GetCursorPos(ctypes.byref(p))
+        return p.x, p.y
+    return _test_cursor()
+
+def left_down():
+    """鼠标左键是否按着（窗口鼠标穿透，直接问系统）"""
+    if IS_WIN:
+        return bool(user32.GetAsyncKeyState(0x01) & 0x8000)
+    return _test_click()
+
+SKIP_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"}
+
+def list_windows():
+    """按 Z 序（最上面在前）返回可见窗口 [(hwnd, l, t, r, b, 能否积雪)]"""
+    if not IS_WIN:
+        return _test_windows()
+    out = []
+    buf = ctypes.create_unicode_buffer(64)
+
+    def cb(hwnd, lp):
+        if hwnd == OVERLAY or not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+            return True
+        if user32.GetWindowLongW(hwnd, -20) & 0x80:
+            return True
+        cloaked = ctypes.c_int(0)
+        dwmapi.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), 4)
+        if cloaked.value:
+            return True
+        user32.GetClassNameW(hwnd, buf, 64)
+        if buf.value in SKIP_CLASSES:
+            return True
+        r = RECT()
+        if dwmapi.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(r), ctypes.sizeof(r)) != 0:
+            user32.GetWindowRect(hwnd, ctypes.byref(r))
+        if r.r - r.l < 80 or r.b - r.t < 40:
+            return True
+        titled = user32.GetWindowTextLengthW(hwnd) > 0
+        can = titled and 6 < r.t < GROUND - 20 and r.r > 0 and r.l < SW
+        out.append((hwnd, r.l, r.t, r.r, r.b, can))
+        return True
+
+    user32.EnumWindows(EnumProc(cb), 0)
+    return out
+
+# ================= 积雪表面 =================
+def smooth_noise(n, scale=12):
+    """平滑的随机起伏，用来让积雪上限高低不平"""
+    k = max(2, n // scale + 2)
+    pts = np.random.uniform(0.7, 1.15, k)
+    return np.interp(np.linspace(0, k - 1, n), np.arange(k), pts)
+
+class Surface:
+    def __init__(self, x0, width, base, cap, is_window, key=None):
+        self.key = key
+        self.x0 = x0
+        self.base = base
+        self.width = width
+        self.n = max(1, int(width // COL_W))
+        self.h = np.zeros(self.n)
+        self.vis = np.ones(self.n, dtype=bool)
+        self.is_window = is_window
+        i = np.arange(self.n)
+        if is_window:
+            # 两头低中间高的雪檐形状 + 随机起伏
+            edge = np.clip(np.minimum(i + 1, self.n - i) / 14.0, 0.12, 1.0)
+            self.cap = cap * np.sqrt(edge) * smooth_noise(self.n)
+        else:
+            self.cap = cap * smooth_noise(self.n, 25)
+        self.spill_l = 0.0
+        self.spill_r = 0.0
+
+    def col_x(self):
+        return self.x0 + np.arange(self.n) * COL_W + COL_W * 0.5
+
+ground = Surface(0, SW + COL_W, GROUND, GROUND_MAX, False)
+win_surfs = {}
+z_order = []
+
+def relax(s, passes=2):
+    """安息角塌落 + 风吹的小起伏 + 窗口边上滑落"""
+    h = s.h
+    for _ in range(passes):
+        if s.n < 2:
+            break
+        d = h[:-1] - h[1:]
+        f = np.where(d > REPOSE, (d - REPOSE) * 0.25,
+                     np.where(d < -REPOSE, (d + REPOSE) * 0.25, 0.0))
+        h[:-1] -= f
+        h[1:] += f
+    # 风吹：随机把一点雪挪到旁边，表面不会是死平的一条
+    k = max(1, s.n // 25)
+    idx = np.random.randint(0, s.n, k)
+    amt = h[idx] * 0.04
+    h[idx] -= amt
+    np.add.at(h, np.clip(idx + np.random.choice([-2, -1, 1, 2], k), 0, s.n - 1), amt)
+    if s.is_window:
+        h -= 0.0006 * (h > 0)                      # 窗口上的雪慢慢化
+    np.maximum(h, 0, out=h)
+    np.minimum(h, s.cap * 1.15, out=h)
+    if s.is_window:
+        for side in (0, -1):
+            ex = h[side] - 1.0
+            if ex > 0:
+                h[side] -= ex
+                if side == 0:
+                    s.spill_l += ex
+                else:
+                    s.spill_r += ex
+        if s.spill_l > 1.0:
+            spawn(s.x0 - 3, s.base - 2, random.uniform(-1.0, -0.2), -0.3, s.spill_l)
+            s.spill_l = 0
+        if s.spill_r > 1.0:
+            spawn(s.x0 + s.width + 3, s.base - 2, random.uniform(0.2, 1.0), -0.3, s.spill_r)
+            s.spill_r = 0
+
+# ================= 雪块 / 雪沫粒子 =================
+MAXP = 5000
+P = {k: np.zeros(MAXP) for k in ("x", "y", "vx", "vy", "v", "life")}
+P["alive"] = np.zeros(MAXP, dtype=bool)
+_pi = [0]
+
+def spawn(x, y, vx, vy, vol, spread=0.3, life=9999):
+    """受重力的雪块。vol>0 落地变积雪；vol=0 是雪雾，life 帧后消失"""
+    first = True
+    while vol > 0 or first:
+        first = False
+        part = min(vol, 1.5)
+        vol -= part
+        i = _pi[0]
+        _pi[0] = (i + 1) % MAXP
+        P["x"][i] = x + random.uniform(-2, 2)
+        P["y"][i] = y
+        P["vx"][i] = vx + random.uniform(-spread, spread)
+        P["vy"][i] = vy + random.uniform(-spread, spread)
+        P["v"][i] = part
+        P["life"][i] = life
+        P["alive"][i] = True
+        if vol <= 1e-6:
+            break
+
+def land(xs, y0, y1, vols):
+    """从 y0 落到 y1 的点是否落在雪面上，落上就堆积（越接近上限越堆不上去）"""
+    landed = np.zeros(len(xs), dtype=bool)
+    for s in z_order + [ground]:
+        col = ((xs - s.x0) // COL_W).astype(int)
+        ok = (col >= 0) & (col < s.n) & ~landed
+        if not ok.any():
+            continue
+        cc = np.clip(col, 0, s.n - 1)
+        top = s.base - s.h[cc]
+        if s is ground:
+            hit = ok & (y1 >= top)
+        else:
+            hit = ok & s.vis[cc] & (y1 >= top) & (y0 <= top + 3)
+        if hit.any():
+            c = cc[hit]
+            room = np.clip(1.0 - s.h[c] / np.maximum(s.cap[c], 0.5), 0.0, 1.0)
+            np.add.at(s.h, c, vols[hit] * (0.15 + 0.85 * room))
+            landed |= hit
+    return landed
+
+def step_particles():
+    a = P["alive"]
+    if not a.any():
+        return
+    idx = np.nonzero(a)[0]
+    x, y = P["x"][idx], P["y"][idx]
+    y0 = y.copy()
+    vol = P["v"][idx]
+    mist = vol <= 0
+    P["vy"][idx] = np.minimum(P["vy"][idx] + np.where(mist, 0.06, 0.25), 9)
+    P["vx"][idx] *= np.where(mist, 0.97, 0.995)
+    x += P["vx"][idx]
+    y += P["vy"][idx]
+    P["x"][idx], P["y"][idx] = x, y
+    P["life"][idx] -= 1
+    falling = P["vy"][idx] > 0
+    hit = land(x, y0, y, vol) & falling & ~mist
+    gone = hit | (y > SH) | (x < -30) | (x > SW + 30) | (P["life"][idx] <= 0)
+    P["alive"][idx[gone]] = False
+
+# ================= 雪花 =================
+fx = np.random.uniform(0, SW, FLAKE_COUNT)
+fy = np.random.uniform(-SH, GROUND, FLAKE_COUNT)
+fr = np.random.choice([1, 1, 2, 2, 2, 3], FLAKE_COUNT)
+fvy = 0.45 + fr * 0.32 + np.random.uniform(0, 0.25, FLAKE_COUNT)
+fph = np.random.uniform(0, math.tau, FLAKE_COUNT)
+fsw = np.random.uniform(0.2, 0.7, FLAKE_COUNT)
+
+def step_flakes(t):
+    global fx, fy
+    y0 = fy.copy()
+    fy += fvy
+    fx += np.sin(t * 1.6 + fph) * fsw * 0.6 + 0.08
+    landed = land(fx, y0, fy, FLAKE_VOL * fr / 2.0)
+    out = landed | (fy > SH) | (fx < -10) | (fx > SW + 10)
+    k = int(out.sum())
+    if k:
+        fx[out] = np.random.uniform(0, SW, k)
+        fy[out] = np.random.uniform(-30, -4, k)
+
+# ================= 窗口跟踪 =================
+def drop_surface(s):
+    xs = s.col_x()
+    for c in range(0, s.n, 2):
+        v = s.h[c] + (s.h[c + 1] if c + 1 < s.n else 0)
+        if v > 0.3:
+            spawn(xs[c], s.base - s.h[c] * 0.5, random.uniform(-0.4, 0.4),
+                  random.uniform(-0.5, 0.5), v)
+
+def scan_windows():
+    global z_order
+    wins = list_windows()
+    seen = set()
+    new_order = []
+    for i, (hwnd, l, t, r, b, can) in enumerate(wins):
+        if not can:
+            continue
+        seen.add(hwnd)
+        s = win_surfs.get(hwnd)
+        if s is None or (r - l) != s.width:
+            if s is not None:
+                drop_surface(s)
+            s = Surface(l, r - l, t, WIN_MAX, True, hwnd)
+            win_surfs[hwnd] = s
+        elif l != s.x0 or t != s.base:
+            if abs(l - s.x0) + abs(t - s.base) > FAST_MOVE:
+                drop_surface(s)
+                s.h[:] = 0
+            s.x0, s.base = l, t
+        xs = s.col_x()
+        vis = (xs >= 0) & (xs < SW)
+        for (h2, l2, t2, r2, b2, _) in wins[:i]:
+            if t2 <= t - 1 < b2:
+                vis &= ~((xs >= l2) & (xs < r2))
+        s.vis = vis
+        new_order.append(s)
+    for hwnd in list(win_surfs):
+        if hwnd not in seen:
+            drop_surface(win_surfs.pop(hwnd))
+    z_order = new_order
+
+# ================= 鼠标 =================
+mouse = {"x": 0, "y": 0, "dx": 0, "dy": 0, "down": False, "click": False}
+
+def read_mouse():
+    mx, my = get_cursor()
+    mouse["dx"], mouse["dy"] = mx - mouse["x"], my - mouse["y"]
+    mouse["x"], mouse["y"] = mx, my
+    d = left_down()
+    mouse["click"] = d and not mouse["down"]
+    mouse["down"] = d
+
+def mouse_push():
+    mx, my, dx = mouse["x"], mouse["y"], mouse["dx"]
+    for s in z_order + [ground]:
+        c = int((mx - s.x0) // COL_W)
+        if c < -MOUSE_R or c >= s.n + MOUSE_R:
+            continue
+        if my < s.base - s.cap.max() - 8 or my > s.base + 4:
+            continue
+        for k in range(max(0, c - MOUSE_R), min(s.n, c + MOUSE_R + 1)):
+            if not s.vis[k]:
+                continue
+            top = s.base - s.h[k]
+            if my <= top:
+                continue
+            rem = min(s.h[k], (my - top) * 0.5 + 0.2)
+            if rem <= 0.05:
+                continue
+            s.h[k] -= rem
+            if abs(dx) > 1:
+                dest = c + (MOUSE_R + 1) * (1 if dx > 0 else -1)
+            else:
+                dest = c - MOUSE_R - 1 if k < c else c + MOUSE_R + 1
+            push = rem * 0.7
+            if 0 <= dest < s.n:
+                s.h[dest] += push
+            else:
+                spawn(s.x0 + dest * COL_W, s.base - 3, 0, 0, push)
+            spawn(s.x0 + k * COL_W, top, dx * 0.25 + random.uniform(-0.8, 0.8),
+                  random.uniform(-3.5, -1.2), rem * 0.3)
+        return
+
+# ================= 铲雪车（抛雪机）=================
+plow = {"on": False, "x": -200.0}
+
+def call_plow():
+    if not plow["on"]:
+        plow["on"] = True
+        plow["x"] = -170.0
+
+def plow_front():
+    return plow["x"] + 146
+
+def plow_step():
+    """铲斗下的雪被扬起来往前上方抛洒、打散，一部分化成雪雾"""
+    if not plow["on"]:
+        return
+    plow["x"] += PLOW_SPEED
+    bf = int(plow_front() // COL_W)
+    lo, hi = max(0, bf - 10), min(ground.n, bf + 1)
+    if hi > lo:
+        carried = float(ground.h[lo:hi].sum())
+        ground.h[lo:hi] = 0
+        keep = carried * (1 - PLOW_VANISH)
+        fx0 = plow_front() - 4
+        fy0 = GROUND - 30
+        while keep > 0:
+            part = min(keep, random.uniform(0.4, 1.4))
+            keep -= part
+            sp = random.uniform(3, 10)
+            ang = random.uniform(math.radians(35), math.radians(80))
+            spawn(fx0, fy0 + random.uniform(-10, 10), PLOW_SPEED + sp * math.cos(ang),
+                  -sp * math.sin(ang), part, spread=0.8)
+        for _ in range(min(12, int(carried * 0.6) + 2)):       # 雪雾
+            spawn(fx0, fy0, PLOW_SPEED + random.uniform(1, 6), random.uniform(-6, -2), 0,
+                  spread=1.2, life=random.randint(30, 70))
+    if plow["x"] > SW + 30:
+        plow["on"] = False
+
+# ================= pygame 窗口 =================
+import pygame
+
+if TEST_FRAMES:
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+os.environ["SDL_VIDEO_WINDOW_POS"] = "0,0"
+pygame.init()
+screen = pygame.display.set_mode((SW, SH), pygame.NOFRAME)
+pygame.display.set_caption("snow")
+
+def setup_overlay():
+    global OVERLAY
+    if not IS_WIN or TEST_FRAMES:
+        return
+    hwnd = pygame.display.get_wm_info()["window"]
+    OVERLAY = hwnd
+    ex = user32.GetWindowLongW(hwnd, -20)
+    user32.SetWindowLongW(hwnd, -20, ex | 0x80000 | 0x20 | 0x80 | 0x08000000)
+    user32.SetLayeredWindowAttributes(hwnd, 0x00FF00FF, 0, 0x1)
+    user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
+
+setup_overlay()
+
+SNOW = (255, 255, 255)
+SNOW_EDGE = (226, 236, 247)
+SNOW_SHADE = (205, 220, 238)
+
+def new_sprite(w, h):
+    s = pygame.Surface((w, h))
+    s.fill(KEY)
+    s.set_colorkey(KEY)
+    return s
+
+sprites = {}
+for r in (1, 2, 3, 4, 5):
+    sp = new_sprite(r * 2 + 1, r * 2 + 1)
+    pygame.draw.circle(sp, SNOW, (r, r), r)
+    sprites[r] = sp
+mist_sprite = new_sprite(3, 3)
+mist_sprite.fill((236, 244, 252))
+
+def draw_surface(s):
+    """画积雪：顶面平滑处理，底部一条浅蓝阴影，看起来有厚度"""
+    show = s.vis & (s.h > 0.4)
+    if not show.any():
+        return
+    hs = np.convolve(s.h, np.array([1, 2, 3, 2, 1]) / 9.0, mode="same")
+    xs = s.x0 + np.arange(s.n) * COL_W
+    tops = s.base - hs
+    idx = np.nonzero(show)[0]
+    breaks = np.nonzero(np.diff(idx) > 1)[0]
+    starts = np.concatenate(([0], breaks + 1))
+    ends = np.concatenate((breaks, [len(idx) - 1]))
+    for a, b in zip(starts, ends):
+        i0, i1 = idx[a], idx[b]
+        top_pts = list(zip((xs[i0:i1 + 1] + COL_W * 0.5).tolist(), tops[i0:i1 + 1].tolist()))
+        pts = [(xs[i0], s.base + 1)] + top_pts + [(xs[i1] + COL_W, s.base + 1)]
+        pygame.draw.polygon(screen, SNOW, pts)
+        # 底部阴影：只在雪厚的地方画
+        shade = [(x, max(y, s.base - 3)) for x, y in top_pts]
+        pygame.draw.polygon(screen, SNOW_SHADE, [(xs[i0], s.base + 1)] + shade + [(xs[i1] + COL_W, s.base + 1)])
+        if len(top_pts) > 1:
+            pygame.draw.lines(screen, SNOW_EDGE, False, top_pts, 1)
+
+# ================= 雪人（雪球物理）=================
+def shaded_ball(sp, c, r):
+    """画一个有明暗的雪球：外圈偏蓝，往左上越来越亮"""
+    steps = [(196, 212, 232), (214, 227, 243), (228, 237, 248), (240, 246, 252), (250, 252, 255), (255, 255, 255)]
+    for i, col in enumerate(steps):
+        rr = r - i * r * 0.11
+        off = i * r * 0.07
+        pygame.draw.circle(sp, col, (int(c - off), int(c - off)), int(rr))
+
+def coal(sp, x, y, r):
+    pygame.draw.circle(sp, (28, 28, 34), (int(x), int(y)), r)
+    pygame.draw.circle(sp, (120, 120, 135), (int(x - r * 0.35), int(y - r * 0.35)), max(1, r // 3))
+
+def make_ball(kind, r):
+    pad = 46 if kind == "mid" else (30 if kind == "head" else 4)
+    S = 2 * (r + pad)
+    sp = new_sprite(S, S)
+    c = S // 2
+    if kind == "mid":       # 树枝手臂先画，球盖在上面
+        for sgn in (-1, 1):
+            x0, y0 = c + sgn * r * 0.7, c - r * 0.15
+            x1, y1 = c + sgn * (r + 40), c - r * 0.95
+            pygame.draw.line(sp, (98, 64, 36), (x0, y0), (x1, y1), 4)
+            mx, my = x0 + (x1 - x0) * 0.65, y0 + (y1 - y0) * 0.65
+            pygame.draw.line(sp, (98, 64, 36), (mx, my), (mx + sgn * 8, my - 13), 3)
+            pygame.draw.line(sp, (98, 64, 36), (x1, y1), (x1 + sgn * 9, y1 - 3), 2)
+            pygame.draw.line(sp, (98, 64, 36), (x1, y1), (x1 + sgn * 3, y1 - 10), 2)
+    shaded_ball(sp, c, r)
+    if kind == "bottom":
+        for (dx, dy) in ((-0.35, -0.2), (0.3, 0.25), (-0.1, 0.45)):
+            pygame.draw.circle(sp, (238, 244, 251), (int(c + dx * r), int(c + dy * r)), 3)
+    elif kind == "mid":
+        for k in range(3):
+            coal(sp, c, c - r * 0.25 + k * r * 0.33, 4)
+        # 围巾：脖子上一圈 + 垂下来的一条
+        red, red2, stripe = (206, 44, 52), (160, 28, 38), (250, 236, 210)
+        pygame.draw.ellipse(sp, red, (c - r * 0.8, c - r - 6, r * 1.6, 14))
+        for k in range(4):
+            xx = c - r * 0.6 + k * r * 0.4
+            pygame.draw.line(sp, stripe, (xx, c - r - 4), (xx + 4, c - r + 6), 2)
+        tail = [(c + r * 0.25, c - r + 2), (c + r * 0.55, c - r + 2), (c + r * 0.65, c - r + 30), (c + r * 0.32, c - r + 32)]
+        pygame.draw.polygon(sp, red, tail)
+        pygame.draw.line(sp, red2, tail[1], tail[2], 2)
+        for k in range(4):
+            fx_ = c + r * 0.34 + k * 4
+            pygame.draw.line(sp, red, (fx_, c - r + 31), (fx_, c - r + 37), 2)
+    elif kind == "head":
+        coal(sp, c - r * 0.36, c - r * 0.22, 4)
+        coal(sp, c + r * 0.36, c - r * 0.22, 4)
+        pygame.draw.circle(sp, (255, 190, 200), (int(c - r * 0.62), int(c + r * 0.2)), 4)
+        pygame.draw.circle(sp, (255, 190, 200), (int(c + r * 0.62), int(c + r * 0.2)), 4)
+        nose = [(c - 1, c - 3), (c + r + 8, c + 1), (c - 1, c + 5)]
+        pygame.draw.polygon(sp, (255, 132, 24), nose)
+        for k in (0.35, 0.6, 0.85):
+            xx = c + (r + 8) * k
+            pygame.draw.line(sp, (205, 95, 10), (xx, c - 2 + k * 3), (xx, c + 4 - k * 2), 1)
+        for k in range(5):
+            a = math.radians(200 + k * 35)
+            coal(sp, c + math.cos(a) * r * 0.5 * -1, c + r * 0.38 + abs(k - 2) * -2, 2)
+    return sp
+
+def make_hat(style):
+    """帽子精灵，帽檐底部中心在 (45, 52)"""
+    sp = new_sprite(90, 70)
+    x, top = 45, 52
+    dc = pygame.draw
+    if style == 0:      # 礼帽
+        dc.ellipse(sp, (20, 20, 24), (x - 28, top - 6, 56, 10))
+        dc.rect(sp, (24, 24, 28), (x - 16, top - 38, 32, 35))
+        dc.rect(sp, (190, 40, 50), (x - 16, top - 12, 32, 6))
+        dc.line(sp, (70, 70, 80), (x - 12, top - 36), (x - 12, top - 14), 2)
+    elif style == 1:    # 圣诞帽
+        dc.polygon(sp, (205, 35, 45), [(x - 22, top - 2), (x + 22, top - 2), (x + 8, top - 30), (x + 32, top - 38)])
+        dc.rect(sp, (250, 250, 252), (x - 24, top - 8, 48, 10), border_radius=4)
+        dc.circle(sp, (250, 250, 252), (x + 32, top - 38), 7)
+    elif style == 2:    # 毛线帽
+        dc.ellipse(sp, (46, 120, 210), (x - 22, top - 30, 44, 40))
+        for k in range(5):
+            dc.line(sp, (80, 150, 230), (x - 14 + k * 7, top - 24), (x - 14 + k * 7, top - 6), 2)
+        dc.rect(sp, (245, 200, 60), (x - 23, top - 8, 46, 10), border_radius=3)
+        dc.circle(sp, (245, 200, 60), (x, top - 32), 8)
+    elif style == 3:    # 皇冠
+        dc.polygon(sp, (242, 196, 30), [(x - 20, top), (x + 20, top), (x + 23, top - 24), (x + 11, top - 11),
+                                        (x, top - 28), (x - 11, top - 11), (x - 23, top - 24)])
+        for dx, col in ((-11, (230, 70, 60)), (0, (50, 140, 220)), (11, (40, 190, 110))):
+            dc.circle(sp, col, (x + dx, top - 5), 3)
+    else:               # 草帽
+        dc.ellipse(sp, (220, 182, 104), (x - 36, top - 8, 72, 13))
+        dc.ellipse(sp, (232, 196, 118), (x - 17, top - 26, 34, 26))
+        dc.rect(sp, (60, 120, 200), (x - 16, top - 9, 32, 4))
+    return sp
+
+HAT_SPRITES = [make_hat(i) for i in range(5)]
+
+class Ball:
+    def __init__(self, kind, r):
+        self.kind, self.r = kind, r
+        self.m = r * r
+        self.sprite = make_ball(kind, r)
+        self.x = self.y = 0.0
+        self.vx = self.vy = 0.0
+        self.ang = 0.0          # 角度（度）
+        self.w = 0.0            # 空中自转
+
+balls = [Ball("bottom", 36), Ball("mid", 27), Ball("head", 20)]
+hat = {"style": 0, "x": 0.0, "y": 0.0, "vx": 0.0, "vy": 0.0, "ang": 0.0, "w": 0.0, "t": time.time()}
+sm = {"state": "stand", "bx": SW - 130, "build": 0, "from": None}
+
+def floor_at(x):
+    c = int(min(ground.n - 1, max(0, x // COL_W)))
+    return GROUND - ground.h[c] * 0.55          # 球会陷进雪里一点
+
+def stack_targets(bx):
+    fy = floor_at(bx)
+    b, m, h = balls
+    yb = fy - b.r
+    ym = yb - b.r - m.r + 9
+    yh = ym - m.r - h.r + 7
+    return [(bx, yb), (bx, ym), (bx, yh)], (bx, yh - h.r + 4 - 17)   # 帽子精灵中心
+
+def knock(direction):
+    """被撞倒：上面的球飞得更远，帽子飞出去"""
+    sgn = 1 if direction >= 0 else -1
+    sm["state"] = "loose"
+    b, m, h = balls
+    b.vx, b.vy = sgn * 0.6, 0
+    m.vx, m.vy, m.w = sgn * 2.6, -1.5, -sgn * 4
+    h.vx, h.vy, h.w = sgn * 4.2, -3.0, -sgn * 7
+    hat.update(vx=sgn * 4.5 + random.uniform(-1, 1), vy=-6, w=-sgn * random.uniform(6, 12))
+
+def rebuild(bx):
+    bx = min(SW - 80, max(80, bx))
+    sm["state"] = "build"
+    sm["bx"] = bx
+    sm["build"] = 0
+    sm["from"] = [(b.x, b.y, ((b.ang + 180) % 360) - 180) for b in balls] + [(hat["x"], hat["y"], ((hat["ang"] + 180) % 360) - 180)]
+
+def step_snowman():
+    b, m, h = balls
+    if sm["state"] == "stand":
+        tg, hp = stack_targets(sm["bx"])
+        for ball, (x, y) in zip(balls, tg):
+            ball.x, ball.y, ball.vx, ball.vy, ball.ang = x, y, 0, 0, 0
+        hat["x"], hat["y"], hat["ang"] = hp[0], hp[1], 0
+        if time.time() - hat["t"] > HAT_SECONDS:
+            hat["style"] = (hat["style"] + 1) % len(HAT_SPRITES)
+            hat["t"] = time.time()
+        # 鼠标撞上去
+        sp = math.hypot(mouse["dx"], mouse["dy"])
+        for ball in balls:
+            if math.hypot(mouse["x"] - ball.x, mouse["y"] - ball.y) < ball.r + 8 and sp > 2.5:
+                knock(mouse["dx"] if abs(mouse["dx"]) > 0.5 else (ball.x - mouse["x"]))
+                return
+        # 铲雪车开过来也会撞倒
+        if plow["on"] and plow_front() > b.x - b.r and plow["x"] < b.x:
+            knock(1)
+        return
+
+    if sm["state"] == "build":
+        sm["build"] += 1
+        t = min(1.0, sm["build"] / 45.0)
+        e = t * t * (3 - 2 * t)
+        tg, hp = stack_targets(sm["bx"])
+        for i, ball in enumerate(balls):
+            x0, y0, a0 = sm["from"][i]
+            ti = min(1.0, max(0.0, (t - i * 0.12) / 0.76))
+            ei = ti * ti * (3 - 2 * ti)
+            ball.x = x0 + (tg[i][0] - x0) * ei
+            ball.y = y0 + (tg[i][1] - y0) * ei - math.sin(math.pi * ei) * 60
+            ball.ang = a0 * (1 - ei)
+        x0, y0, a0 = sm["from"][3]
+        hat["x"] = x0 + (hp[0] - x0) * e
+        hat["y"] = y0 + (hp[1] - y0) * e - math.sin(math.pi * e) * 90
+        hat["ang"] = a0 * (1 - e)
+        if t >= 1.0:
+            sm["state"] = "stand"
+            hat["t"] = time.time()
+        return
+
+    # ---- loose：三个球自由滚动 ----
+    # 单击掉落的雪球（或帽子）就地重新堆雪人（先判断点击，再处理推球）
+    if mouse["click"]:
+        for ball in balls:
+            if math.hypot(mouse["x"] - ball.x, mouse["y"] - ball.y) < ball.r + 6:
+                rebuild(ball.x)
+                return
+        if math.hypot(mouse["x"] - hat["x"], mouse["y"] - hat["y"]) < 24:
+            rebuild(hat["x"])
+            return
+    moving = math.hypot(mouse["dx"], mouse["dy"]) > 1.0
+    for ball in balls:
+        ball.vy += GRAVITY
+        ball.vx *= 0.997
+        ball.x += ball.vx
+        ball.y += ball.vy
+        fl = floor_at(ball.x)
+        if ball.y + ball.r >= fl:
+            ball.y = fl - ball.r
+            ball.vy = -ball.vy * 0.25 if ball.vy > 2.5 else 0
+            ball.vx *= 0.985                           # 在雪里滚的阻力
+            ball.ang -= ball.vx / ball.r * 57.3        # 纯滚动
+            ball.w = 0
+        else:
+            ball.ang += ball.w
+            ball.w *= 0.99
+        if ball.x < ball.r:
+            ball.x, ball.vx = ball.r, abs(ball.vx) * 0.4
+        if ball.x > SW - ball.r:
+            ball.x, ball.vx = SW - ball.r, -abs(ball.vx) * 0.4
+        if ball.y < ball.r:
+            ball.y, ball.vy = ball.r, abs(ball.vy) * 0.3
+        # 鼠标推球
+        d = math.hypot(ball.x - mouse["x"], ball.y - mouse["y"])
+        if moving and d < ball.r + 10 and d > 0.01:
+            nx, ny = (ball.x - mouse["x"]) / d, (ball.y - mouse["y"]) / d
+            ov = ball.r + 10 - d
+            ball.x += nx * ov
+            ball.y += ny * ov
+            push = max(0.0, mouse["dx"] * nx + mouse["dy"] * ny) + 0.3
+            k = min(2.0, max(0.4, 900.0 / ball.m))
+            ball.vx += nx * push * k * 0.8
+            ball.vy += ny * push * k * 0.8
+        # 铲雪车推球
+        if plow["on"] and plow["x"] + 100 < ball.x < plow_front() + ball.r and ball.y > GROUND - 90:
+            ball.x = plow_front() + ball.r
+            ball.vx = max(ball.vx, PLOW_SPEED + 0.5)
+    # 球与球碰撞
+    for _ in range(4):
+        for i in range(3):
+            for j in range(i + 1, 3):
+                A, B = balls[i], balls[j]
+                dx, dy = B.x - A.x, B.y - A.y
+                d = math.hypot(dx, dy)
+                if 0.01 < d < A.r + B.r:
+                    nx, ny = dx / d, dy / d
+                    ov = A.r + B.r - d
+                    ia, ib = 1 / A.m, 1 / B.m
+                    A.x -= nx * ov * ia / (ia + ib)
+                    A.y -= ny * ov * ia / (ia + ib)
+                    B.x += nx * ov * ib / (ia + ib)
+                    B.y += ny * ov * ib / (ia + ib)
+                    vrel = (B.vx - A.vx) * nx + (B.vy - A.vy) * ny
+                    if vrel < 0:
+                        jimp = -(1.15) * vrel / (ia + ib)
+                        A.vx -= jimp * ia * nx
+                        A.vy -= jimp * ia * ny
+                        B.vx += jimp * ib * nx
+                        B.vy += jimp * ib * ny
+    # 帽子
+    hat["vy"] += GRAVITY
+    hat["vx"] *= 0.995
+    hat["x"] += hat["vx"]
+    hat["y"] += hat["vy"]
+    hat["ang"] += hat["w"]
+    fl = floor_at(hat["x"])
+    if hat["y"] + 12 >= fl:
+        hat["y"] = fl - 12
+        hat["vy"] = -hat["vy"] * 0.2 if hat["vy"] > 2 else 0
+        hat["vx"] *= 0.9
+        hat["w"] *= 0.8
+        rest = round(hat["ang"] / 90.0) * 90.0              # 慢慢躺平
+        hat["ang"] += (rest - hat["ang"]) * 0.15
+    hat["x"] = min(SW - 20, max(20, hat["x"]))
+    d = math.hypot(hat["x"] - mouse["x"], hat["y"] - mouse["y"])
+    if moving and d < 22:
+        hat["vx"] += mouse["dx"] * 0.4
+        hat["vy"] += mouse["dy"] * 0.4 - 1
+        hat["w"] += mouse["dx"] * 0.8
+
+def draw_snowman():
+    for ball in balls:
+        spr = pygame.transform.rotate(ball.sprite, ball.ang) if abs(ball.ang) > 0.5 else ball.sprite
+        screen.blit(spr, spr.get_rect(center=(int(ball.x), int(ball.y))))
+    spr = HAT_SPRITES[hat["style"]]
+    if abs(hat["ang"]) > 0.5:
+        spr = pygame.transform.rotate(spr, hat["ang"])
+    screen.blit(spr, spr.get_rect(center=(int(hat["x"]), int(hat["y"]))))
+
+# ================= 铲雪车外观 =================
+def draw_plow():
+    if not plow["on"]:
+        return
+    x, g = int(plow["x"]), GROUND
+    dc = pygame.draw
+    dc.rect(screen, (243, 156, 18), (x, g - 42, 110, 28), border_radius=4)
+    dc.rect(screen, (163, 95, 0), (x, g - 42, 110, 28), 2, border_radius=4)
+    dc.rect(screen, (243, 156, 18), (x + 55, g - 74, 45, 34), border_radius=4)
+    dc.rect(screen, (163, 95, 0), (x + 55, g - 74, 45, 34), 2, border_radius=4)
+    dc.rect(screen, (174, 227, 255), (x + 63, g - 68, 30, 20))
+    blink = (231, 76, 60) if (pygame.time.get_ticks() // 300) % 2 else (255, 200, 60)
+    dc.rect(screen, blink, (x + 70, g - 82, 10, 8))
+    # 抛雪口
+    dc.polygon(screen, (90, 96, 100), [(x + 112, g - 30), (x + 140, g - 58), (x + 150, g - 50), (x + 124, g - 22)])
+    dc.polygon(screen, (127, 140, 141), [(x + 112, g - 34), (x + 146, g - 30), (x + 146, g), (x + 112, g - 3)])
+    dc.polygon(screen, (77, 86, 86), [(x + 112, g - 34), (x + 146, g - 30), (x + 146, g), (x + 112, g - 3)], 2)
+    for k in range(3):
+        dc.line(screen, (70, 75, 78), (x + 118 + k * 9, g - 30), (x + 118 + k * 9, g - 4), 2)
+    for wx in (x + 22, x + 82):
+        dc.circle(screen, (44, 44, 44), (wx, g - 13), 15)
+        dc.circle(screen, (150, 150, 150), (wx, g - 13), 6)
+
+# ================= 托盘 =================
+cmds = []
+running = [True]
+
+def start_tray():
+    try:
+        import pystray
+        from PIL import Image, ImageDraw
+    except Exception:
+        return
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse((14, 28, 50, 62), fill="white", outline="gray")
+    d.ellipse((20, 6, 44, 30), fill="white", outline="gray")
+
+    def quit_app(icon, item):
+        running[0] = False
+        icon.stop()
+
+    menu = pystray.Menu(
+        pystray.MenuItem("清空积雪", lambda i, it: cmds.append("clear")),
+        pystray.MenuItem("退出", quit_app),
+    )
+    pystray.Icon("snow", img, "桌面下雪", menu).run()
+
+# ================= 测试替身（只在非 Windows 测试时用）=================
+_frame = [0]
+def _test_windows():
+    f = _frame[0]
+    w = [(1, 200, 250, 700, 600, True), (2, 600, 380, 1000, 650, True)]
+    if f > TEST_FRAMES * 0.85:
+        w = w[1:]
+    return w
+
+def _test_cursor():
+    f = _frame[0]
+    if 100 <= f < 130:                    # 从左边撞雪人
+        return int(SW - 260 + (f - 100) * 6), GROUND - 90
+    if f == int(TEST_FRAMES * 0.7):       # 去点一个雪球
+        b = balls[0]
+        return int(b.x), int(b.y)
+    return 50, 50
+
+def _test_click():
+    return _frame[0] == int(TEST_FRAMES * 0.7)
+
+# ================= 主循环 =================
+def main():
+    if not TEST_FRAMES:
+        threading.Thread(target=start_tray, daemon=True).start()
+    clock = pygame.time.Clock()
+    frame = 0
+    t0 = time.time()
+    if TEST_FRAMES:
+        ground.h[:] = np.random.uniform(20, 34, ground.n)
+    while running[0]:
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                running[0] = False
+        while cmds:
+            c = cmds.pop(0)
+            if c == "hat":
+                hat["style"] = (hat["style"] + 1) % len(HAT_SPRITES)
+                hat["t"] = time.time()
+            elif c == "build":
+                rebuild(sm["bx"] if sm["state"] == "stand" else balls[0].x)
+            elif c == "plow":
+                call_plow()
+            elif c == "clear":
+                ground.h[:] = 0
+                for s in z_order:
+                    s.h[:] = 0
+        t = time.time() - t0
+        if frame % WIN_SCAN_EVERY == 0:
+            scan_windows()
+        read_mouse()
+        step_flakes(t)
+        step_particles()
+        mouse_push()
+        if not FREE_EDITION:
+            plow_step()
+        relax(ground, 2)
+        for s in z_order:
+            relax(s, 2)
+        if FREE_EDITION:
+            np.minimum(ground.h, FREE_GROUND_MAX, out=ground.h)   # 免费版：地面积雪封顶
+        else:
+            step_snowman()
+            if not plow["on"] and ground.h.mean() > PLOW_TRIGGER:
+                call_plow()
+            if frame == 60 * 4:
+                call_plow()
+
+        screen.fill(KEY)
+        for s in reversed(z_order):
+            draw_surface(s)
+        draw_surface(ground)
+        if not FREE_EDITION:
+            draw_snowman()
+            draw_plow()
+        blits = [(sprites[int(r)], (x - r, y - r)) for x, y, r in zip(fx.tolist(), fy.tolist(), fr.tolist())]
+        for i in np.nonzero(P["alive"])[0].tolist():
+            v = P["v"][i]
+            if v <= 0:
+                blits.append((mist_sprite, (P["x"][i] - 1, P["y"][i] - 1)))
+            else:
+                r = int(min(5, max(1, math.sqrt(v) * 1.8)))
+                blits.append((sprites[r], (P["x"][i] - r, P["y"][i] - r)))
+        screen.blits(blits, doreturn=False)
+        pygame.display.flip()
+        frame += 1
+        _frame[0] = frame
+        if TEST_FRAMES:
+            if frame in TEST_SHOTS:
+                pygame.image.save(screen, f"test_{frame}.png")
+            if frame >= TEST_FRAMES:
+                break
+        else:
+            clock.tick(FPS)
+    pygame.quit()
+
+TEST_SHOTS = set(int(x) for x in os.environ.get("SNOW_TEST_SHOTS", "").split(",") if x)
+
+if __name__ == "__main__":
+    main()

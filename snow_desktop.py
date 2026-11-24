@@ -78,7 +78,8 @@ if IS_WIN:
         return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1), r.b
 else:
     def screen_info():
-        return 1280, 720, 680
+        w, h = [int(v) for v in os.environ.get("SNOW_TEST_SIZE", "1280x720").split("x")]
+        return w, h, h - 40
 
 SW, SH, GROUND = screen_info()
 OVERLAY = None
@@ -484,6 +485,42 @@ for r in (1, 2, 3, 4, 5):
 mist_sprite = new_sprite(3, 3)
 mist_sprite.fill((236, 244, 252))
 
+# ================= 局部刷新 =================
+# 以前每帧把整块屏幕（3440x1440 约 2000 万字节）清空再整张推给 Windows，大屏会很卡。
+# 现在把屏幕切成 32px 的小格，只清空、只刷新这一帧和上一帧有东西的格子。
+GRID = 32
+GW, GH = (SW + GRID - 1) // GRID, (SH + GRID - 1) // GRID
+DIRTY = []                                   # 这一帧画过的矩形
+_prev_mask = np.ones((GH, GW), dtype=bool)   # 上一帧有东西的格子（第一帧全屏）
+
+def mark(rect):
+    DIRTY.append(rect)
+
+def _rects_to_mask(rects):
+    m = np.zeros((GH, GW), dtype=bool)
+    if not rects:
+        return m
+    a = np.array([tuple(r) for r in rects], dtype=np.int64).reshape(-1, 4)
+    a = a[(a[:, 2] > 0) & (a[:, 3] > 0)]
+    c0 = np.clip(a[:, 0] // GRID, 0, GW - 1); c1 = np.clip((a[:, 0] + a[:, 2]) // GRID, 0, GW - 1)
+    r0 = np.clip(a[:, 1] // GRID, 0, GH - 1); r1 = np.clip((a[:, 1] + a[:, 3]) // GRID, 0, GH - 1)
+    small = (c1 - c0 <= 1) & (r1 - r0 <= 1)          # 雪花这种小东西最多占 2x2 格，直接一次性标记
+    for rr, cc in ((r0, c0), (r0, c1), (r1, c0), (r1, c1)):
+        m[rr[small], cc[small]] = True
+    for i in np.nonzero(~small)[0].tolist():         # 大的（积雪、雪人、推土机）逐个标
+        m[r0[i]:r1[i] + 1, c0[i]:c1[i] + 1] = True
+    return m
+
+def _mask_runs(m):
+    """把格子合并成横条矩形，减少推给 Windows 的次数"""
+    pad = np.zeros((GH, GW + 2), dtype=np.int8)
+    pad[:, 1:-1] = m
+    d = np.diff(pad, axis=1)
+    sr, sc = np.nonzero(d == 1)
+    _, ec = np.nonzero(d == -1)
+    return [pygame.Rect(a * GRID, r * GRID, (b - a) * GRID, GRID)
+            for r, a, b in zip(sr.tolist(), sc.tolist(), ec.tolist())]
+
 def draw_surface(s):
     """画积雪：顶面平滑处理，底部一条浅蓝阴影，看起来有厚度"""
     show = s.vis & (s.h > 0.4)
@@ -500,7 +537,7 @@ def draw_surface(s):
         i0, i1 = idx[a], idx[b]
         top_pts = list(zip((xs[i0:i1 + 1] + COL_W * 0.5).tolist(), tops[i0:i1 + 1].tolist()))
         pts = [(xs[i0], s.base + 1)] + top_pts + [(xs[i1] + COL_W, s.base + 1)]
-        pygame.draw.polygon(screen, SNOW, pts)
+        mark(pygame.draw.polygon(screen, SNOW, pts))
         # 底部阴影：只在雪厚的地方画
         shade = [(x, max(y, s.base - 3)) for x, y in top_pts]
         pygame.draw.polygon(screen, SNOW_SHADE, [(xs[i0], s.base + 1)] + shade + [(xs[i1] + COL_W, s.base + 1)])
@@ -846,17 +883,18 @@ def step_snowman():
 def draw_snowman():
     for ball in balls:
         spr = pygame.transform.rotate(ball.sprite, ball.ang) if abs(ball.ang) > 0.5 else ball.sprite
-        screen.blit(spr, spr.get_rect(center=(int(ball.x), int(ball.y))))
+        mark(screen.blit(spr, spr.get_rect(center=(int(ball.x), int(ball.y)))))
     spr = HAT_SPRITES[hat["style"]]
     if abs(hat["ang"]) > 0.5:
         spr = pygame.transform.rotate(spr, hat["ang"])
-    screen.blit(spr, spr.get_rect(center=(int(hat["x"]), int(hat["y"]))))
+    mark(screen.blit(spr, spr.get_rect(center=(int(hat["x"]), int(hat["y"])))))
 
 # ================= 履带推土机外观 =================
 def draw_plow():
     if not plow["on"]:
         return
     x, g = int(plow["x"]), GROUND
+    mark((x - 40, g - 170, 300, 175))                   # 推土机整体范围
     dc = pygame.draw
     Y, YD, DK = (245, 180, 20), (170, 115, 0), (40, 40, 44)
     # 履带：圆角长条 + 会动的履带齿
@@ -956,6 +994,7 @@ def _test_click():
 
 # ================= 主循环 =================
 def main():
+    global _prev_mask
     if not TEST_FRAMES:
         threading.Thread(target=start_tray, daemon=True).start()
     clock = pygame.time.Clock()
@@ -998,7 +1037,11 @@ def main():
         if frame == 60 * 4:
             call_plow()
 
-        screen.fill(KEY)
+        # 只清空上一帧画过的格子
+        prev_runs = _mask_runs(_prev_mask)
+        for r in prev_runs:
+            screen.fill(KEY, r)
+        DIRTY.clear()
         for s in reversed(z_order):
             draw_surface(s)
         draw_surface(ground)
@@ -1006,15 +1049,21 @@ def main():
         draw_plow()
         n = snow["n"]
         blits = [(sprites[int(r)], (x - r, y - r)) for x, y, r in zip(fx[:n].tolist(), fy[:n].tolist(), fr[:n].tolist())]
-        for i in np.nonzero(P["alive"])[0].tolist():
-            v = P["v"][i]
-            if v <= 0:
-                blits.append((mist_sprite, (P["x"][i] - 1, P["y"][i] - 1)))
-            else:
-                r = int(min(5, max(1, math.sqrt(v) * 1.8)))
-                blits.append((sprites[r], (P["x"][i] - r, P["y"][i] - r)))
-        screen.blits(blits, doreturn=False)
-        pygame.display.flip()
+        ai = np.nonzero(P["alive"])[0]
+        if len(ai):
+            pv, px, py = P["v"][ai], P["x"][ai], P["y"][ai]
+            pr = np.where(pv <= 0, 0, np.clip(np.sqrt(np.maximum(pv, 0)) * 1.8, 1, 5).astype(int))
+            for x, y, r in zip(px.tolist(), py.tolist(), pr.tolist()):
+                if r == 0:
+                    blits.append((mist_sprite, (x - 1, y - 1)))
+                else:
+                    blits.append((sprites[r], (x - r, y - r)))
+        DIRTY.extend(screen.blits(blits))
+        cur_mask = _rects_to_mask(DIRTY)
+        pygame.display.update(_mask_runs(cur_mask | _prev_mask))   # 只把变化的地方推给 Windows
+        _prev_mask = cur_mask
+        if TEST_FRAMES and frame % 100 == 0:
+            print("刷新面积占比", round(float((cur_mask | _prev_mask).mean()), 3))
         frame += 1
         _frame[0] = frame
         if TEST_FRAMES:

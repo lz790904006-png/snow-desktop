@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-桌面下雪 v4（Windows 10/11）
+桌面下雪 v5（Windows 10/11）
 - 60 帧 pygame + numpy，雪花顺滑飘落
 - 雪会落在窗口顶边上，堆成两头低、中间起伏的自然雪檐；窗口关闭、最小化、改大小或被甩动时雪会掉下来
 - 鼠标划过积雪会把雪推开、溅起雪沫
+- 雪量三档：小雪 / 中雪 / 大雪，托盘「雪量」切换；窗口标题栏上的雪积得更快、不会化掉
 - 履带推土机：履带会转、排气管冒烟，推铲把雪顶起来往前撒开，一部分化成雪雾
-- 新雪人：带明暗的三个雪球，鼠标一撞就会倒，三个球各自滚动、互相碰撞，帽子飞出去
+- 新雪人：带明暗的三个雪球，鼠标左键点一下就会倒，三个球各自滚动、互相碰撞，帽子飞出去
 - 雪人倒了以后，鼠标左键单击任意一个掉落的雪球，就会在那里重新堆起雪人
 - 雪人有 6 套衣服（经典、圣诞老人、滑雪运动、国王、夏日度假、绅士），每 25 秒自动换一套，托盘「换衣服」手动换
 运行：python snow_desktop.py
@@ -28,11 +29,14 @@ TEST_FRAMES = int(os.environ.get("SNOW_TEST_FRAMES", "0"))   # 测试用：非 0
 
 # ================= 可调参数 =================
 FPS = 60
-FLAKE_COUNT = 260        # 同时飘落的雪花数
-FLAKE_VOL = 0.55         # 每片雪花带来的积雪量（像素高度）
+FLAKE_MAX = 700          # 雪花数上限（大雪时全部用上）
+# 雪量档位：(同时飘落的雪花数, 每片雪花带来的积雪量)，托盘「雪量」里切换
+SNOW_LEVELS = {"小雪": (260, 1.2), "中雪": (450, 2.4), "大雪": (700, 4.0)}
+SNOW_DEFAULT = "中雪"
+WIN_GAIN = 2.5           # 落在窗口顶上的雪额外放大，标题栏上更快积起来
 COL_W = 3                # 积雪高度图每列宽度（像素）
 GROUND_MAX = 70          # 地面积雪最高
-WIN_MAX = 16             # 窗口顶上积雪最高（中间部分）
+WIN_MAX = 22             # 窗口顶上积雪最高（中间部分）
 REPOSE = 2.0             # 安息角：相邻两列高差超过就塌
 PLOW_TRIGGER = 26        # 地面平均积雪超过这个高度，铲雪车出动
 PLOW_SPEED = 2.6         # 铲雪车速度（像素/帧）
@@ -178,7 +182,7 @@ def relax(s, passes=2):
     h[idx] -= amt
     np.add.at(h, np.clip(idx + np.random.choice([-2, -1, 1, 2], k), 0, s.n - 1), amt)
     if s.is_window:
-        h -= 0.0006 * (h > 0)                      # 窗口上的雪慢慢化
+        h -= 0.00004 * (h > 0)                     # 窗口上的雪极慢地化（以前化得比下得快，存不住）
     np.maximum(h, 0, out=h)
     np.minimum(h, s.cap * 1.15, out=h)
     if s.is_window:
@@ -239,7 +243,8 @@ def land(xs, y0, y1, vols):
         if hit.any():
             c = cc[hit]
             room = np.clip(1.0 - s.h[c] / np.maximum(s.cap[c], 0.5), 0.0, 1.0)
-            np.add.at(s.h, c, vols[hit] * (0.15 + 0.85 * room))
+            gain = WIN_GAIN if s.is_window else 1.0
+            np.add.at(s.h, c, vols[hit] * gain * (0.15 + 0.85 * room))
             landed |= hit
     return landed
 
@@ -264,24 +269,33 @@ def step_particles():
     P["alive"][idx[gone]] = False
 
 # ================= 雪花 =================
-fx = np.random.uniform(0, SW, FLAKE_COUNT)
-fy = np.random.uniform(-SH, GROUND, FLAKE_COUNT)
-fr = np.random.choice([1, 1, 2, 2, 2, 3], FLAKE_COUNT)
-fvy = 0.45 + fr * 0.32 + np.random.uniform(0, 0.25, FLAKE_COUNT)
-fph = np.random.uniform(0, math.tau, FLAKE_COUNT)
-fsw = np.random.uniform(0.2, 0.7, FLAKE_COUNT)
+fx = np.random.uniform(0, SW, FLAKE_MAX)
+fy = np.random.uniform(-SH, GROUND, FLAKE_MAX)
+fr = np.random.choice([1, 1, 2, 2, 2, 3], FLAKE_MAX)
+fvy = 0.6 + fr * 0.4 + np.random.uniform(0, 0.3, FLAKE_MAX)
+fph = np.random.uniform(0, math.tau, FLAKE_MAX)
+fsw = np.random.uniform(0.2, 0.7, FLAKE_MAX)
+snow = {"level": SNOW_DEFAULT, "n": SNOW_LEVELS[SNOW_DEFAULT][0], "vol": SNOW_LEVELS[SNOW_DEFAULT][1]}
+
+def set_snow(level):
+    """切换雪量；新加进来的雪花从屏幕顶上开始落"""
+    n, vol = SNOW_LEVELS[level]
+    if n > snow["n"]:
+        fy[snow["n"]:n] = np.random.uniform(-SH, -4, n - snow["n"])
+    snow.update(level=level, n=n, vol=vol)
 
 def step_flakes(t):
-    global fx, fy
-    y0 = fy.copy()
-    fy += fvy
-    fx += np.sin(t * 1.6 + fph) * fsw * 0.6 + 0.08
-    landed = land(fx, y0, fy, FLAKE_VOL * fr / 2.0)
-    out = landed | (fy > SH) | (fx < -10) | (fx > SW + 10)
+    n = snow["n"]
+    x, y, r = fx[:n], fy[:n], fr[:n]             # 只动用当前档位的雪花（切片是原数组的视图）
+    y0 = y.copy()
+    y += fvy[:n]
+    x += np.sin(t * 1.6 + fph[:n]) * fsw[:n] * 0.6 + 0.08
+    landed = land(x, y0, y, snow["vol"] * r / 2.0)
+    out = landed | (y > SH) | (x < -10) | (x > SW + 10)
     k = int(out.sum())
     if k:
-        fx[out] = np.random.uniform(0, SW, k)
-        fy[out] = np.random.uniform(-30, -4, k)
+        x[out] = np.random.uniform(0, SW, k)
+        y[out] = np.random.uniform(-30, -4, k)
 
 # ================= 窗口跟踪 =================
 def drop_surface(s):
@@ -698,12 +712,12 @@ def step_snowman():
         hat["x"], hat["y"], hat["ang"] = hp[0], hp[1], 0
         if time.time() - hat["t"] > HAT_SECONDS:
             set_outfit(outfit["i"] + 1)
-        # 鼠标撞上去
-        sp = math.hypot(mouse["dx"], mouse["dy"])
-        for ball in balls:
-            if math.hypot(mouse["x"] - ball.x, mouse["y"] - ball.y) < ball.r + 8 and sp > 2.5:
-                knock(mouse["dx"] if abs(mouse["dx"]) > 0.5 else (ball.x - mouse["x"]))
-                return
+        # 鼠标左键点一下雪人就把它推倒：点左边往右倒，点右边往左倒
+        if mouse["click"]:
+            for ball in balls:
+                if math.hypot(mouse["x"] - ball.x, mouse["y"] - ball.y) < ball.r + 6:
+                    knock(ball.x - mouse["x"] if abs(ball.x - mouse["x"]) > 2 else random.choice((-1, 1)))
+                    return
         # 铲雪车开过来也会撞倒
         if plow["on"] and plow_front() > b.x - b.r and plow["x"] < b.x:
             knock(1)
@@ -740,7 +754,6 @@ def step_snowman():
         if math.hypot(mouse["x"] - hat["x"], mouse["y"] - hat["y"]) < 24:
             rebuild(hat["x"])
             return
-    moving = math.hypot(mouse["dx"], mouse["dy"]) > 1.0
     for ball in balls:
         ball.vy += GRAVITY
         ball.vx *= 0.997
@@ -762,17 +775,6 @@ def step_snowman():
             ball.x, ball.vx = SW - ball.r, -abs(ball.vx) * 0.4
         if ball.y < ball.r:
             ball.y, ball.vy = ball.r, abs(ball.vy) * 0.3
-        # 鼠标推球
-        d = math.hypot(ball.x - mouse["x"], ball.y - mouse["y"])
-        if moving and d < ball.r + 10 and d > 0.01:
-            nx, ny = (ball.x - mouse["x"]) / d, (ball.y - mouse["y"]) / d
-            ov = ball.r + 10 - d
-            ball.x += nx * ov
-            ball.y += ny * ov
-            push = max(0.0, mouse["dx"] * nx + mouse["dy"] * ny) + 0.3
-            k = min(2.0, max(0.4, 900.0 / ball.m))
-            ball.vx += nx * push * k * 0.8
-            ball.vy += ny * push * k * 0.8
         # 铲雪车推球
         if plow["on"] and plow["x"] + 100 < ball.x < plow_front() + ball.r and ball.y > GROUND - 90:
             ball.x = plow_front() + ball.r
@@ -814,11 +816,6 @@ def step_snowman():
         rest = round(hat["ang"] / 90.0) * 90.0              # 慢慢躺平
         hat["ang"] += (rest - hat["ang"]) * 0.15
     hat["x"] = min(SW - 20, max(20, hat["x"]))
-    d = math.hypot(hat["x"] - mouse["x"], hat["y"] - mouse["y"])
-    if moving and d < 22:
-        hat["vx"] += mouse["dx"] * 0.4
-        hat["vy"] += mouse["dy"] * 0.4 - 1
-        hat["w"] += mouse["dx"] * 0.8
 
 def draw_snowman():
     for ball in balls:
@@ -896,7 +893,12 @@ def start_tray():
         running[0] = False
         icon.stop()
 
+    def level_item(name):
+        return pystray.MenuItem(name, lambda i, it: cmds.append(name),
+                                checked=lambda it: snow["level"] == name, radio=True)
+
     menu = pystray.Menu(
+        pystray.MenuItem("雪量", pystray.Menu(*[level_item(k) for k in SNOW_LEVELS])),
         pystray.MenuItem("换衣服", lambda i, it: cmds.append("hat")),
         pystray.MenuItem("重新堆雪人", lambda i, it: cmds.append("build")),
         pystray.MenuItem("叫推土机", lambda i, it: cmds.append("plow")),
@@ -916,15 +918,15 @@ def _test_windows():
 
 def _test_cursor():
     f = _frame[0]
-    if 100 <= f < 130:                    # 从左边撞雪人
-        return int(SW - 260 + (f - 100) * 6), GROUND - 90
+    if f == 100:                          # 点一下雪人
+        return int(balls[1].x - 10), int(balls[1].y)
     if f == int(TEST_FRAMES * 0.7):       # 去点一个雪球
         b = balls[0]
         return int(b.x), int(b.y)
     return 50, 50
 
 def _test_click():
-    return _frame[0] == int(TEST_FRAMES * 0.7)
+    return _frame[0] in (100, int(TEST_FRAMES * 0.7))
 
 # ================= 主循环 =================
 def main():
@@ -947,6 +949,8 @@ def main():
                 rebuild(sm["bx"] if sm["state"] == "stand" else balls[0].x)
             elif c == "plow":
                 call_plow()
+            elif c in SNOW_LEVELS:
+                set_snow(c)
             elif c == "clear":
                 ground.h[:] = 0
                 for s in z_order:
@@ -974,7 +978,8 @@ def main():
         draw_surface(ground)
         draw_snowman()
         draw_plow()
-        blits = [(sprites[int(r)], (x - r, y - r)) for x, y, r in zip(fx.tolist(), fy.tolist(), fr.tolist())]
+        n = snow["n"]
+        blits = [(sprites[int(r)], (x - r, y - r)) for x, y, r in zip(fx[:n].tolist(), fy[:n].tolist(), fr[:n].tolist())]
         for i in np.nonzero(P["alive"])[0].tolist():
             v = P["v"][i]
             if v <= 0:
